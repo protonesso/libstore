@@ -3,24 +3,18 @@
 
 #include <cstring>
 #include <cerrno>
+#include <memory>
+
+#include <boost/coroutine2/coroutine.hpp>
 
 
 namespace nix {
 
 
-BufferedSink::~BufferedSink()
-{
-    /* We can't call flush() here, because C++ for some insane reason
-       doesn't allow you to call virtual methods from a destructor. */
-    assert(!bufPos);
-    delete[] buffer;
-}
-
-    
 void BufferedSink::operator () (const unsigned char * data, size_t len)
 {
-    if (!buffer) buffer = new unsigned char[bufSize];
-    
+    if (!buffer) buffer = decltype(buffer)(new unsigned char[bufSize]);
+
     while (len) {
         /* Optimisation: bypass the buffer if the data exceeds the
            buffer size. */
@@ -32,7 +26,7 @@ void BufferedSink::operator () (const unsigned char * data, size_t len)
         /* Otherwise, copy the bytes to the buffer.  Flush the buffer
            when it's full. */
         size_t n = bufPos + len > bufSize ? bufSize - bufPos : len;
-        memcpy(buffer + bufPos, data, n);
+        memcpy(buffer.get() + bufPos, data, n);
         data += n; bufPos += n; len -= n;
         if (bufPos == bufSize) flush();
     }
@@ -44,7 +38,7 @@ void BufferedSink::flush()
     if (bufPos == 0) return;
     size_t n = bufPos;
     bufPos = 0; // don't trigger the assert() in ~BufferedSink()
-    write(buffer, n);
+    write(buffer.get(), n);
 }
 
 
@@ -58,21 +52,32 @@ size_t threshold = 256 * 1024 * 1024;
 
 static void warnLargeDump()
 {
-    printMsg(lvlError, "warning: dumping very large path (> 256 MiB); this may run out of memory");
+    printError("warning: dumping very large path (> 256 MiB); this may run out of memory");
 }
 
 
 void FdSink::write(const unsigned char * data, size_t len)
 {
+    written += len;
     static bool warned = false;
     if (warn && !warned) {
-        written += len;
         if (written > threshold) {
             warnLargeDump();
             warned = true;
         }
     }
-    writeFull(fd, data, len);
+    try {
+        writeFull(fd, data, len);
+    } catch (SysError & e) {
+        _good = false;
+        throw;
+    }
+}
+
+
+bool FdSink::good()
+{
+    return _good;
 }
 
 
@@ -85,21 +90,32 @@ void Source::operator () (unsigned char * data, size_t len)
 }
 
 
-BufferedSource::~BufferedSource()
+std::string Source::drain()
 {
-    delete[] buffer;
+    std::string s;
+    std::vector<unsigned char> buf(8192);
+    while (true) {
+        size_t n;
+        try {
+            n = read(buf.data(), buf.size());
+            s.append((char *) buf.data(), n);
+        } catch (EndOfFile &) {
+            break;
+        }
+    }
+    return s;
 }
 
 
 size_t BufferedSource::read(unsigned char * data, size_t len)
 {
-    if (!buffer) buffer = new unsigned char[bufSize];
+    if (!buffer) buffer = decltype(buffer)(new unsigned char[bufSize]);
 
-    if (!bufPosIn) bufPosIn = readUnbuffered(buffer, bufSize);
-            
+    if (!bufPosIn) bufPosIn = readUnbuffered(buffer.get(), bufSize);
+
     /* Copy out the data in the buffer. */
     size_t n = len > bufPosIn - bufPosOut ? bufPosIn - bufPosOut : len;
-    memcpy(data, buffer + bufPosOut, n);
+    memcpy(data, buffer.get() + bufPosOut, n);
     bufPosOut += n;
     if (bufPosIn == bufPosOut) bufPosIn = bufPosOut = 0;
     return n;
@@ -117,11 +133,18 @@ size_t FdSource::readUnbuffered(unsigned char * data, size_t len)
     ssize_t n;
     do {
         checkInterrupt();
-        n = ::read(fd, (char *) data, bufSize);
+        n = ::read(fd, (char *) data, len);
     } while (n == -1 && errno == EINTR);
-    if (n == -1) throw SysError("reading from file");
-    if (n == 0) throw EndOfFile("unexpected end-of-file");
+    if (n == -1) { _good = false; throw SysError("reading from file"); }
+    if (n == 0) { _good = false; throw EndOfFile("unexpected end-of-file"); }
+    read += n;
     return n;
+}
+
+
+bool FdSource::good()
+{
+    return _good;
 }
 
 
@@ -131,6 +154,61 @@ size_t StringSource::read(unsigned char * data, size_t len)
     size_t n = s.copy((char *) data, len, pos);
     pos += n;
     return n;
+}
+
+
+#if BOOST_VERSION >= 106300 && BOOST_VERSION < 106600
+#error Coroutines are broken in this version of Boost!
+#endif
+
+std::unique_ptr<Source> sinkToSource(
+    std::function<void(Sink &)> fun,
+    std::function<void()> eof)
+{
+    struct SinkToSource : Source
+    {
+        typedef boost::coroutines2::coroutine<std::string> coro_t;
+
+        std::function<void(Sink &)> fun;
+        std::function<void()> eof;
+        std::optional<coro_t::pull_type> coro;
+        bool started = false;
+
+        SinkToSource(std::function<void(Sink &)> fun, std::function<void()> eof)
+            : fun(fun), eof(eof)
+        {
+        }
+
+        std::string cur;
+        size_t pos = 0;
+
+        size_t read(unsigned char * data, size_t len) override
+        {
+            if (!coro)
+                coro = coro_t::pull_type([&](coro_t::push_type & yield) {
+                    LambdaSink sink([&](const unsigned char * data, size_t len) {
+                            if (len) yield(std::string((const char *) data, len));
+                        });
+                    fun(sink);
+                });
+
+            if (!*coro) { eof(); abort(); }
+
+            if (pos == cur.size()) {
+                if (!cur.empty()) (*coro)();
+                cur = coro->get();
+                pos = 0;
+            }
+
+            auto n = std::min(cur.size() - pos, len);
+            memcpy(data, (unsigned char *) cur.data() + pos, n);
+            pos += n;
+
+            return n;
+        }
+    };
+
+    return std::make_unique<SinkToSource>(fun, eof);
 }
 
 
@@ -144,56 +222,39 @@ void writePadding(size_t len, Sink & sink)
 }
 
 
-void writeInt(unsigned int n, Sink & sink)
-{
-    unsigned char buf[8];
-    memset(buf, 0, sizeof(buf));
-    buf[0] = n & 0xff;
-    buf[1] = (n >> 8) & 0xff;
-    buf[2] = (n >> 16) & 0xff;
-    buf[3] = (n >> 24) & 0xff;
-    sink(buf, sizeof(buf));
-}
-
-
-void writeLongLong(unsigned long long n, Sink & sink)
-{
-    unsigned char buf[8];
-    buf[0] = n & 0xff;
-    buf[1] = (n >> 8) & 0xff;
-    buf[2] = (n >> 16) & 0xff;
-    buf[3] = (n >> 24) & 0xff;
-    buf[4] = (n >> 32) & 0xff;
-    buf[5] = (n >> 40) & 0xff;
-    buf[6] = (n >> 48) & 0xff;
-    buf[7] = (n >> 56) & 0xff;
-    sink(buf, sizeof(buf));
-}
-
-
 void writeString(const unsigned char * buf, size_t len, Sink & sink)
 {
-    writeInt(len, sink);
+    sink << len;
     sink(buf, len);
     writePadding(len, sink);
 }
 
 
-void writeString(const string & s, Sink & sink)
+Sink & operator << (Sink & sink, const string & s)
 {
     writeString((const unsigned char *) s.data(), s.size(), sink);
+    return sink;
 }
 
 
 template<class T> void writeStrings(const T & ss, Sink & sink)
 {
-    writeInt(ss.size(), sink);
-    foreach (typename T::const_iterator, i, ss)
-        writeString(*i, sink);
+    sink << ss.size();
+    for (auto & i : ss)
+        sink << i;
 }
 
-template void writeStrings(const Paths & ss, Sink & sink);
-template void writeStrings(const PathSet & ss, Sink & sink);
+Sink & operator << (Sink & sink, const Strings & s)
+{
+    writeStrings(s, sink);
+    return sink;
+}
+
+Sink & operator << (Sink & sink, const StringSet & s)
+{
+    writeStrings(s, sink);
+    return sink;
+}
 
 
 void readPadding(size_t len, Source & source)
@@ -208,60 +269,36 @@ void readPadding(size_t len, Source & source)
 }
 
 
-unsigned int readInt(Source & source)
-{
-    unsigned char buf[8];
-    source(buf, sizeof(buf));
-    if (buf[4] || buf[5] || buf[6] || buf[7])
-        throw SerialisationError("implementation cannot deal with > 32-bit integers");
-    return
-        buf[0] |
-        (buf[1] << 8) |
-        (buf[2] << 16) |
-        (buf[3] << 24);
-}
-
-
-unsigned long long readLongLong(Source & source)
-{
-    unsigned char buf[8];
-    source(buf, sizeof(buf));
-    return
-        ((unsigned long long) buf[0]) |
-        ((unsigned long long) buf[1] << 8) |
-        ((unsigned long long) buf[2] << 16) |
-        ((unsigned long long) buf[3] << 24) |
-        ((unsigned long long) buf[4] << 32) |
-        ((unsigned long long) buf[5] << 40) |
-        ((unsigned long long) buf[6] << 48) |
-        ((unsigned long long) buf[7] << 56);
-}
-
-
 size_t readString(unsigned char * buf, size_t max, Source & source)
 {
-    size_t len = readInt(source);
-    if (len > max) throw Error("string is too long");
+    auto len = readNum<size_t>(source);
+    if (len > max) throw SerialisationError("string is too long");
     source(buf, len);
     readPadding(len, source);
     return len;
 }
 
- 
-string readString(Source & source)
+
+string readString(Source & source, size_t max)
 {
-    size_t len = readInt(source);
-    unsigned char * buf = new unsigned char[len];
-    AutoDeleteArray<unsigned char> d(buf);
-    source(buf, len);
+    auto len = readNum<size_t>(source);
+    if (len > max) throw SerialisationError("string is too long");
+    std::string res(len, 0);
+    source((unsigned char*) res.data(), len);
     readPadding(len, source);
-    return string((char *) buf, len);
+    return res;
 }
 
- 
+Source & operator >> (Source & in, string & s)
+{
+    s = readString(in);
+    return in;
+}
+
+
 template<class T> T readStrings(Source & source)
 {
-    unsigned int count = readInt(source);
+    auto count = readNum<size_t>(source);
     T ss;
     while (count--)
         ss.insert(ss.end(), readString(source));
@@ -275,11 +312,11 @@ template PathSet readStrings(Source & source);
 void StringSink::operator () (const unsigned char * data, size_t len)
 {
     static bool warned = false;
-    if (!warned && s.size() > threshold) {
+    if (!warned && s->size() > threshold) {
         warnLargeDump();
         warned = true;
     }
-    s.append((const char *) data, len);
+    s->append((const char *) data, len);
 }
 
 

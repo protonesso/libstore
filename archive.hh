@@ -44,17 +44,13 @@ namespace nix {
 
      `+' denotes string concatenation. */
 
-struct PathFilter
-{
-    virtual ~PathFilter() { }
-    virtual bool operator () (const Path & path) { return true; }
-};
-
-extern PathFilter defaultPathFilter;
 
 void dumpPath(const Path & path, Sink & sink,
     PathFilter & filter = defaultPathFilter);
 
+void dumpString(const std::string & s, Sink & sink);
+
+/* FIXME: fix this API, it sucks. */
 struct ParseSink
 {
     virtual void createDirectory(const Path & path) { };
@@ -67,8 +63,24 @@ struct ParseSink
     virtual void createSymlink(const Path & path, const string & target) { };
 };
 
+struct TeeSink : ParseSink
+{
+    TeeSource source;
+
+    TeeSink(Source & source) : source(source) { }
+};
+
 void parseDump(ParseSink & sink, Source & source);
 
 void restorePath(const Path & path, Source & source);
+
+/* Read a NAR from 'source' and write it to 'sink'. */
+void copyNAR(Source & source, Sink & sink);
+
+void copyPath(const Path & from, const Path & to);
+
+
+extern const std::string narVersionMagic1;
+
 
 }

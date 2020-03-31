@@ -1,48 +1,28 @@
-#include "config.h"
-
 #include <iostream>
 #include <cstring>
 
-#ifdef HAVE_OPENSSL
 #include <openssl/md5.h>
 #include <openssl/sha.h>
-#else
-extern "C" {
-#include "md5.h"
-#include "sha1.h"
-#include "sha256.h"
-#include "sha512.h"
-}
-#endif
 
 #include "hash.hh"
 #include "archive.hh"
 #include "util.hh"
+#include "istringstream_nocopy.hh"
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
-
 namespace nix {
 
 
-Hash::Hash()
+void Hash::init()
 {
-    type = htUnknown;
-    hashSize = 0;
-    memset(hash, 0, maxHashSize);
-}
-
-
-Hash::Hash(HashType type)
-{
-    this->type = type;
     if (type == htMD5) hashSize = md5HashSize;
     else if (type == htSHA1) hashSize = sha1HashSize;
     else if (type == htSHA256) hashSize = sha256HashSize;
     else if (type == htSHA512) hashSize = sha512HashSize;
-    else throw Error("unknown hash type");
+    else abort();
     assert(hashSize <= maxHashSize);
     memset(hash, 0, maxHashSize);
 }
@@ -65,6 +45,8 @@ bool Hash::operator != (const Hash & h2) const
 
 bool Hash::operator < (const Hash & h) const
 {
+    if (hashSize < h.hashSize) return true;
+    if (hashSize > h.hashSize) return false;
     for (unsigned int i = 0; i < hashSize; i++) {
         if (hash[i] < h.hash[i]) return true;
         if (hash[i] > h.hash[i]) return false;
@@ -76,7 +58,7 @@ bool Hash::operator < (const Hash & h) const
 const string base16Chars = "0123456789abcdef";
 
 
-string printHash(const Hash & hash)
+static string printHash16(const Hash & hash)
 {
     char buf[hash.hashSize * 2];
     for (unsigned int i = 0; i < hash.hashSize; i++) {
@@ -87,43 +69,20 @@ string printHash(const Hash & hash)
 }
 
 
-Hash parseHash(HashType ht, const string & s)
-{
-    Hash hash(ht);
-    if (s.length() != hash.hashSize * 2)
-        throw Error(format("invalid hash `%1%'") % s);
-    for (unsigned int i = 0; i < hash.hashSize; i++) {
-        string s2(s, i * 2, 2);
-        if (!isxdigit(s2[0]) || !isxdigit(s2[1]))
-            throw Error(format("invalid hash `%1%'") % s);
-        std::istringstream str(s2);
-        int n;
-        str >> std::hex >> n;
-        hash.hash[i] = n;
-    }
-    return hash;
-}
-
-
-unsigned int hashLength32(const Hash & hash)
-{
-    return (hash.hashSize * 8 - 1) / 5 + 1;
-}
-
-
 // omitted: E O U T
 const string base32Chars = "0123456789abcdfghijklmnpqrsvwxyz";
 
 
-string printHash32(const Hash & hash)
+static string printHash32(const Hash & hash)
 {
-    Hash hash2(hash);
-    unsigned int len = hashLength32(hash);
+    assert(hash.hashSize);
+    size_t len = hash.base32Len();
+    assert(len);
 
     string s;
     s.reserve(len);
 
-    for (int n = len - 1; n >= 0; n--) {
+    for (int n = (int) len - 1; n >= 0; n--) {
         unsigned int b = n * 5;
         unsigned int i = b / 8;
         unsigned int j = b % 8;
@@ -139,64 +98,115 @@ string printHash32(const Hash & hash)
 
 string printHash16or32(const Hash & hash)
 {
-    return hash.type == htMD5 ? printHash(hash) : printHash32(hash);
+    return hash.to_string(hash.type == htMD5 ? Base16 : Base32, false);
 }
 
 
-Hash parseHash32(HashType ht, const string & s)
+std::string Hash::to_string(Base base, bool includeType) const
 {
-    Hash hash(ht);
-    unsigned int len = hashLength32(ht);
-    assert(s.size() == len);
+    std::string s;
+    if (base == SRI || includeType) {
+        s += printHashType(type);
+        s += base == SRI ? '-' : ':';
+    }
+    switch (base) {
+    case Base16:
+        s += printHash16(*this);
+        break;
+    case Base32:
+        s += printHash32(*this);
+        break;
+    case Base64:
+    case SRI:
+        s += base64Encode(std::string((const char *) hash, hashSize));
+        break;
+    }
+    return s;
+}
 
-    for (unsigned int n = 0; n < len; ++n) {
-        char c = s[len - n - 1];
-        unsigned char digit;
-        for (digit = 0; digit < base32Chars.size(); ++digit) /* !!! slow */
-            if (base32Chars[digit] == c) break;
-        if (digit >= 32)
-            throw Error(format("invalid base-32 hash '%1%'") % s);
-        unsigned int b = n * 5;
-        unsigned int i = b / 8;
-        unsigned int j = b % 8;
-        hash.hash[i] |= digit << j;
-        if (i < hash.hashSize - 1) hash.hash[i + 1] |= digit >> (8 - j);
+
+Hash::Hash(const std::string & s, HashType type)
+    : type(type)
+{
+    size_t pos = 0;
+    bool isSRI = false;
+
+    auto sep = s.find(':');
+    if (sep == string::npos) {
+        sep = s.find('-');
+        if (sep != string::npos) {
+            isSRI = true;
+        } else if (type == htUnknown)
+            throw BadHash("hash '%s' does not include a type", s);
     }
 
-    return hash;
-}
+    if (sep != string::npos) {
+        string hts = string(s, 0, sep);
+        this->type = parseHashType(hts);
+        if (this->type == htUnknown)
+            throw BadHash("unknown hash type '%s'", hts);
+        if (type != htUnknown && type != this->type)
+            throw BadHash("hash '%s' should have type '%s'", s, printHashType(type));
+        pos = sep + 1;
+    }
 
+    init();
 
-Hash parseHash16or32(HashType ht, const string & s)
-{
-    Hash hash(ht);
-    if (s.size() == hash.hashSize * 2)
-        /* hexadecimal representation */
-        hash = parseHash(ht, s);
-    else if (s.size() == hashLength32(hash))
-        /* base-32 representation */
-        hash = parseHash32(ht, s);
+    size_t size = s.size() - pos;
+
+    if (!isSRI && size == base16Len()) {
+
+        auto parseHexDigit = [&](char c) {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            throw BadHash("invalid base-16 hash '%s'", s);
+        };
+
+        for (unsigned int i = 0; i < hashSize; i++) {
+            hash[i] =
+                parseHexDigit(s[pos + i * 2]) << 4
+                | parseHexDigit(s[pos + i * 2 + 1]);
+        }
+    }
+
+    else if (!isSRI && size == base32Len()) {
+
+        for (unsigned int n = 0; n < size; ++n) {
+            char c = s[pos + size - n - 1];
+            unsigned char digit;
+            for (digit = 0; digit < base32Chars.size(); ++digit) /* !!! slow */
+                if (base32Chars[digit] == c) break;
+            if (digit >= 32)
+                throw BadHash("invalid base-32 hash '%s'", s);
+            unsigned int b = n * 5;
+            unsigned int i = b / 8;
+            unsigned int j = b % 8;
+            hash[i] |= digit << j;
+
+            if (i < hashSize - 1) {
+                hash[i + 1] |= digit >> (8 - j);
+            } else {
+                if (digit >> (8 - j))
+                    throw BadHash("invalid base-32 hash '%s'", s);
+            }
+        }
+    }
+
+    else if (isSRI || size == base64Len()) {
+        auto d = base64Decode(std::string(s, pos));
+        if (d.size() != hashSize)
+            throw BadHash("invalid %s hash '%s'", isSRI ? "SRI" : "base-64", s);
+        assert(hashSize);
+        memcpy(hash, d.data(), hashSize);
+    }
+
     else
-        throw Error(format("hash `%1%' has wrong length for hash type `%2%'")
-            % s % printHashType(ht));
-    return hash;
+        throw BadHash("hash '%s' has wrong length for hash type '%s'", s, printHashType(type));
 }
 
 
-bool isHash(const string & s)
-{
-    if (s.length() != 32) return false;
-    for (int i = 0; i < 32; i++) {
-        char c = s[i];
-        if (!((c >= '0' && c <= '9') ||
-              (c >= 'a' && c <= 'f')))
-            return false;
-    }
-    return true;
-}
-
-
-struct Ctx
+union Ctx
 {
     MD5_CTX md5;
     SHA_CTX sha1;
@@ -215,7 +225,7 @@ static void start(HashType ht, Ctx & ctx)
 
 
 static void update(HashType ht, Ctx & ctx,
-    const unsigned char * bytes, unsigned int len)
+    const unsigned char * bytes, size_t len)
 {
     if (ht == htMD5) MD5_Update(&ctx.md5, bytes, len);
     else if (ht == htSHA1) SHA1_Update(&ctx.sha1, bytes, len);
@@ -246,23 +256,9 @@ Hash hashString(HashType ht, const string & s)
 
 Hash hashFile(HashType ht, const Path & path)
 {
-    Ctx ctx;
-    Hash hash(ht);
-    start(ht, ctx);
-
-    AutoCloseFD fd = open(path.c_str(), O_RDONLY);
-    if (fd == -1) throw SysError(format("opening file `%1%'") % path);
-
-    unsigned char buf[8192];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf)))) {
-        checkInterrupt();
-        if (n == -1) throw SysError(format("reading file `%1%'") % path);
-        update(ht, ctx, buf, n);
-    }
-
-    finish(ht, ctx, hash.hash);
-    return hash;
+    HashSink sink(ht);
+    readFile(path, sink);
+    return sink.finish().first;
 }
 
 
@@ -338,7 +334,7 @@ string printHashType(HashType ht)
     else if (ht == htSHA1) return "sha1";
     else if (ht == htSHA256) return "sha256";
     else if (ht == htSHA512) return "sha512";
-    else throw Error("cannot print unknown hash type");
+    else abort();
 }
 
 
